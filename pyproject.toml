@@ -1,10 +1,10 @@
 [project]
 name = "treeflows"
-version = "0.0.9"
+version = "0.0.10"
 authors = [
  { name="Moshe Jasper", email="mjasper@student.unimelb.edu.au" },
 ]
-description = "repository for functions for preparing and working with tree sequences"
+description = "repository for functions for preparing and working with genetic data and tree sequences"
 readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [
@@ -28,13 +28,14 @@ treeseq = [
     "tscompare@git+https://github.com/tskit-dev/tscompare@0.2", 
 ]
 stats = ["pandas", "scipy"]
-fasta = ["pyfaidx"]
+fasta = ["pyfaidx", "biopython"]
 graph = ["svglib", "matplotlib", "seaborn", "reportlab"]
 full = [
     "numpy>= 2.1",
     "pandas",
     "cyvcf2",
     "pyfaidx",
+    "biopython",
     "dendropy", 
     "tskit", 
     "tsinfer@git+https://github.com/tskit-dev/tsinfer@0.5.0", 

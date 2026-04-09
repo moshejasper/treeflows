@@ -1,16 +1,12 @@
 #!/bin/python3
 
-#import vcf2est as est
-#import gzip
-#import cyvcf2
-#from itertools import compress
 import numpy as np
-#from statistics import mean, median
 from treeflows import vcf_core as _vcf
-#from pathlib import Path
-from scipy.stats import norm, poisson, nbinom
+from scipy.stats import norm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from treeflows.gff import GenomeMask
+from treeflows.Spath import Mpath
+from pathlib import Path
 
 
 def get_genint_str(filefix, pref, suff):
@@ -33,31 +29,6 @@ def _safe_depths(var):
 def alpha_from_sd(val):
         """Convert SD threshold to two-sided alpha."""
         return float(2 * norm.sf(val))
-
-def _nb_tail_pvalues_with_overdisp(k, lam, phi, overdisp_factor=1.0):
-    """
-    k: (W,N) observed counts (int or float, will be rounded)
-    lam: (W,N) expected mean counts
-    phi: scalar (global NB2 dispersion)
-    overdisp_factor: scalar multiplier on phi
-
-    returns: p_low, p_high (W,N)
-    """
-    eps = 1e-12
-
-    # inflate dispersion
-    phi_eff = float(phi) * float(overdisp_factor)
-    if not np.isfinite(phi_eff) or phi_eff <= 0:
-        phi_eff = 1e-6
-
-    r = 1.0 / (phi_eff + eps)              # "size" parameter
-    p = r / (r + lam + eps)                # success prob; mean=lam, var=lam+lam^2/r
-
-    k_int = np.rint(k).astype(np.int64)
-
-    p_low = nbinom.cdf(k_int, r, p)
-    p_high = nbinom.sf(k_int - 1, r, p)
-    return p_low, p_high, phi_eff
 
 def _transform_depth(Y, transform="none", log_pseudocount=0.5):
     """Transform normalized depth matrix."""
@@ -93,16 +64,13 @@ def _process_one_vcf_file(
     Worker: process a single .vcf.gz and return (samples, chrom_dict, repcount, skipcount).
     chrom_dict[chrom] = {"depths": (W,N), "sitecounts": (W,), "window_indices": (W,)}
     """
-    import numpy as np
-    from treeflows import vcf_core  # ensure import inside worker if needed by multiprocessing
 
-    vcf = vcf_core.VCFReader(vcf_path)
+    vcf = _vcf.VCFReader(vcf_path)
     samples = vcf.samples
     ll = len(samples)
 
     if genint is not None:
         _chrom, _start, _end = parse_genint(genint)
-        #vcf.set_region(chrom, start, end)
     else:
         _chrom, _start, _end = None, None, None
 
@@ -218,7 +186,7 @@ def _merge_chrom_dicts(chrom_dicts_in_order):
 
 
 def get_depths_dict_parallel(
-    fixlist: list,
+    fixlist: list|str,
     window=10_000,
     n_jobs=8,
     min_miss_frac=0.5,
@@ -228,7 +196,20 @@ def get_depths_dict_parallel(
     gen_intvs=None,
     use_ints=False): # silence worker progress
 
-    fixfiles = [f + ".vcf.gz" for f in fixlist]
+    if isinstance(fixlist, str):
+        fixlist = [fixlist,]
+
+    # WORK OUT THE SUFFIXES.NO .BAMS YET
+    f1 = fixlist[0]
+    if f1.endswith('.vcf.gz') or f1.endswith('.vcf'):
+        fixfiles = fixlist
+    elif Path(f1 + '.vcf.gz').exists():
+        fixfiles = [f + '.vcf.gz' for f in fixlist]
+    elif Path(f1 + '.vcf').exists():
+        fixfiles = [f + '.vcf' for f in fixlist]
+    else:
+        raise ValueError(f"Unknown file format for {f1}. Needs to be '.vcf.gz' or '.vcf'") # not yet implementing .bcf as issues with vcf_core
+
     genints = gen_intvs if use_ints else [None] * len(fixfiles) # if not using genints, just pass None to workers
 
     # run workers
@@ -274,201 +255,7 @@ def get_depths_dict_parallel(
     # merge in file order
     chrom_dict = _merge_chrom_dicts(results)
 
-    # from here, continue exactly as you already do:
-    # - build glob_depths / glob_sitecounts from chrom_dict
-    # - apply window_depth_thresh and your NB/Poisson/OptionB logic
-    # - map back to chrom/positions and write outputs
-
     return chrom_dict, sample_ref
-
-
-def _get_outliers_from_chrom_dict(
-    chrom_dict,
-    window=10_000,
-    threshold_frac=0.05,
-    alpha=1e-6,
-    min_sites=20,
-    window_depth_thresh=5,
-    distrib="nbinom", 
-    overdisp_factor=1.0, 
-    use_median=True, 
-    var_per_window=False):
-    """Given chrom_dict and sample list, compute outlier windows."""
-
-    if distrib not in ("poisson", "nbinom", "normal", "ragweed"):
-        raise ValueError("distrib must be one of 'poisson', 'nbinom', 'normal', or 'ragweed'")
-    # global summary: add rows from all chromosomes into one array
-    glob_depths = np.vstack([chrom_dict[chrom]["depths"] for chrom in chrom_dict])
-    glob_sitecounts = np.concatenate([chrom_dict[chrom]["sitecounts"] for chrom in chrom_dict])
-    # get idv mean depth in array shaped such that we can normalize by idv average depth
-    #idv_mean_depths = np.sum(glob_depths, axis=0) / np.sum(glob_sitecounts)
-
-    ### Poisson outlier model ----
-    k = glob_depths.astype(float)       # (n_windows, n_idv)
-    E = glob_sitecounts.astype(float)       # (n_windows,)
-
-    # prevent divide-by-zero in arithmetic
-    E_safe = E.copy()
-    E_safe[E_safe == 0] = np.nan
-
-    # 1) per-sample global mean depth per site (size factor basis), normalized to mean 1
-    ### NORMALIZED MEAN INDIVIDUAL DEPTH ###
-    #idv_mean_depths = np.nansum(k, axis=0) / np.nansum(E_safe)   # mean DP per site, per sample (n_idv,)
-    #s = idv_mean_depths / np.nanmean(idv_mean_depths)  # (n_idv,) - mean 1 across idvs (normalized mean depth, individuals)
-    depth_per_site = k / (E_safe[:, None]) # per site depth
-    usable_w = (E >= min_sites) & np.isfinite(E_safe)
-    idv_depth = np.nanmedian(depth_per_site[usable_w, :], axis=0) if use_median else np.nanmean(depth_per_site[usable_w, :], axis=0) # median depth per site, per sample (n_idv,) across usable windows
-    idv_scale = idv_depth / np.nanmedian(idv_depth) if use_median else idv_depth / np.nanmean(idv_depth) # (n_idv, )  # divide by this
-
-    # 2) window baseline mu_w: median normalized depth per site across samples
-    ### NORMED PER SITE & INDIVIDUAL (mean-normed) # TODO: figure out if this should be median??? could be affected by outliers??? 
-    normed_depths = k / (E_safe[:, None] * idv_scale[None, :])  # (n_windows, n_idv) # Y_{w, i} = k/(E*s)
-
-    # MEDIAN VALUE PER WINDOW (normed by mean previously)
-    mu = np.nanmedian(normed_depths, axis=1) if use_median else np.nanmean(normed_depths, axis=1)  # (n_windows,)
-
-    # expected lambda (mean counts) for each (window, individual)
-    # EXPECTED COUNTS FOR WINDOW/INDIVIDUAL
-    lam = (mu[:, None] * E_safe[:, None]) * idv_scale[None, :]  # (n_windows, n_idv)
-    # SELECTION MASK FOR DATA CALCULATION
-    usable = (E >= min_sites) & np.isfinite(mu) & (mu > 0) & (mu >= window_depth_thresh) # windows that aren't deep enough skipped
-
-    # 3) estimate global NB dispersion phi (NB2)
-    #     Var = mean + phi * mean^2
-    # -------------------
-    eps = 1e-12
-    
-    # across individuals, on the normalized per-site scale Y = k/(E*s)
-    m_w = np.nanmean(normed_depths, axis=1)  # (n_windows,)             # WINDOW MEAN # USE MEAN ALWAYS HERE (in contrast to mu above) AS THIS IS FOR PHI CALCULATION, WHICH IS SENSITIVE TO OUTLIERS.
-    v_w = np.nanvar(normed_depths, axis=1, ddof=1)   # (n_windows,)     # WINDOW VARIANCE
-
-    phi_w = (v_w - m_w) / (m_w**2 + eps)  # (n_windows,)    # PHI (?) FOR NBINOM? 
-    phi_w = np.where(phi_w > 0, phi_w, 0.0)  # set negative dispersions to 0
-
-    # robust global phi (ignore non-usable windows)
-    phi = np.nanmedian(phi_w[usable]) if use_median else np.nanmean(phi_w[usable])                       # NOW SET TO MEDIAN (global phi median?)
-    # if phi collapses to 0 or NaN, fall back to small dispersion
-    if not np.isfinite(phi) or phi <= 0:
-        phi = 1e-6
-
-    def alpha_from_sd(val):
-        """Convert SD threshold to two-sided alpha."""
-        return 2 * norm.sf(val)
-
-    # -------------------
-    # NB model
-    # 4) NB tail p-values (one-sided)
-    # SciPy nbinom parametrization
-    # n = r (number of successes), p = success prob
-    # mean = r*(1-p)/p = lam
-    # var = lam + lam^2 / r
-    # so r = 1/phi, p = r / (r + lam)
-    if distrib == "nbinom":
-        if var_per_window:
-            pass
-        p_low, p_high, phi_eff = _nb_tail_pvalues_with_overdisp(k, lam, phi, overdisp_factor=overdisp_factor) # CALCULATED FROM DEPTH ARRAY, EXPECTED, PHI & OVERDISPERSE
-        r = 1.0 / phi_eff
-        p_nb = r / (r + lam)
-
-        k_lower_cut = nbinom.ppf(alpha, r, p_nb) # NBINOM QUANTILE FOR ALPHA
-        k_upper_cut = nbinom.isf(alpha, r, p_nb) # NB
-
-    # -----------------------
-    # POISSON model
-    # 4) Poisson tail p-values (one-sided)
-    # low tail: P(X <= k )
-    elif distrib == "poisson":
-        p_low = poisson.cdf(k, lam) # DEPTH ARRAY VS EXPECTED
-        
-        # largest k such that P(X <= k) <= alpha
-        k_lower_cut = poisson.ppf(alpha, lam) # POISSON QUANTILE FOR ALPHA
-
-        # high tail: P(X >= k ) = sf(k-1)
-        p_high = poisson.sf(k-1, lam) 
-        # smallest k such that P(X >= k) <= alpha
-        k_upper_cut = poisson.isf(alpha, lam) # POISSON INVERSE SF FOR ALPHA
-
-    elif distrib == "normal":
-        # normal approximation
-        sd_w = np.sqrt(v_w) # SD PER WINDOW
-        sd = np.nanmedian(sd_w[usable]) if use_median else np.nanmean(sd_w[usable]) # global SD
-        z_scores = (k - lam) / sd (k - lam) / sd_w[:, None] if var_per_window else (k - lam) / sd 
-
-        p_low = norm.cdf(z_scores)
-        p_high = norm.sf(z_scores)
-
-        k_lower_cut = norm.ppf(alpha, loc=lam, scale=sd)
-        k_upper_cut = norm.isf(alpha, loc=lam, scale=sd)
-
-    elif distrib == "ragweed": # Try to implement something approximating the ragweed paper (2sd for each window)
-        # mean & sd from each individual window... for best results, use mean mode... 
-        # m_w & v_w here... now for sd_w
-        # make dispersion factor here 2x SD
-        sd_w = np.sqrt(v_w) # SD PER WINDOW
-        z_scores = (k - lam) / sd_w[:, None] # no adjustment here
-
-        p_low = norm.cdf(z_scores)
-        p_high = norm.sf(z_scores)
-
-        # ragweed update: TODO evaluate this later
-        alpha = alpha_from_sd(2) # 2 SD threshold
-        k_lower_cut = norm.ppf(alpha, loc=lam, scale=sd_w[:, None]) # should be windowed... in future can generalize this... 
-        k_upper_cut = norm.isf(alpha, loc=lam, scale=sd_w[:, None])
-
-    # 5) IDENTIFY OUTLIER INDIDIVUALS IN WINDOWS based on alpha threshold and usable windows
-    fail_lower = (p_low <= alpha) & usable[:, None]
-    fail_upper = (p_high <= alpha) & usable[:, None]
-    fail_array = fail_lower | fail_upper
-
-    # 6) Cohort-level filter: window must have >= threhold_frac outliers
-    fail_frac_upper = fail_upper.mean(axis=1)
-    fail_frac_lower = fail_lower.mean(axis=1)
-    fail_frac = fail_array.mean(axis=1) # FAIL ARRAY (MEAN PER WINDOW) # TODO: update this so that only 1 direction counts... 
-    #fail_windows = np.where(fail_frac >= threshold_frac)[0] # SELECT BASED ON THRESHOLD
-    upper_fail = fail_frac_upper >= threshold_frac
-    lower_fail = fail_frac_lower >= threshold_frac
-    fail_windows = np.where(upper_fail | lower_fail)[0] # SELECT ON THRESHOLD - MUST BE IN AT LEAST ONE
-
-    depth_lower_cut = k_lower_cut / E_safe[:, None] # CONVERT TO DEPTH CUTS
-    depth_upper_cut = k_upper_cut / E_safe[:, None]
-
-    if distrib == "nbinom":
-        print(f"NB dispersion phi_eff={phi_eff:.3g} (x {overdisp_factor}); "
-              f"flagged {len(fail_windows)} windows at alpha={alpha}, frac>={threshold_frac}, min_sites={min_sites}", flush=True)
-    ### PREPARE FINAL OUTPUT ###
-
-    fail_window_positions = []
-    cum_window_counts = []
-    cum_count = 0
-    for chrom in chrom_dict:
-        win_dict = chrom_dict[chrom]
-        nwin = len(win_dict["sitecounts"])
-        start_idx = cum_count
-        cum_count += nwin
-        cum_window_counts.append((chrom, cum_count, start_idx))
-    for fw in fail_windows:
-        for cc in cum_window_counts:
-            chrom, cum_count, start_idx = cc
-            if fw < cum_count:
-                # this is the chromosome
-                win_dict = chrom_dict[chrom]
-                wstart = win_dict["window_indices"][fw - start_idx] * window + 1
-                depth_meds_window = mu[fw]
-                #depth_sd_window = std_depths[fw]
-                fail_upper_list = np.where(fail_upper[fw])[0]
-                fail_lower_list = np.where(fail_lower[fw])[0]
-                depth_lower_cut_window = np.nanmedian(depth_lower_cut[fw])
-                depth_upper_cut_window = np.nanmedian(depth_upper_cut[fw])
-
-                #print(f"{chrom}:{wstart}-{wstart+window-1}, frac: {fail_frac[fw]:.3f}, high depth: {', '.join([idvs[i] for i in fail_upper_list])}, low depth: {', '.join([idvs[i] for i in fail_lower_list])}")
-                fail_window_positions.append((chrom, wstart, fail_lower_list, fail_upper_list, fail_frac[fw], 
-                                              depth_meds_window, depth_lower_cut_window, depth_upper_cut_window))
-                break
-                # else continue
-    print(f"{'Median' if use_median else 'Mean'} outlier fraction per window:", np.median(fail_frac) if use_median else np.mean(fail_frac))
-    print("95th percentile outlier fraction per window:", np.percentile(fail_frac, 95))
-    return fail_window_positions
-
 
 def get_outliers_from_chrom_dict_normalized(
     chrom_dict,
@@ -573,13 +360,8 @@ def get_outliers_from_chrom_dict_normalized(
     p_high = norm.sf(z)
 
     # normalized cutoffs
-    y_lower_cut = mu[:, None] + norm.ppf(alpha) * sigma[:, None]
-    y_upper_cut = mu[:, None] + norm.isf(alpha) * sigma[:, None]
-
-    # or equivalently:
-    # zcrit = norm.isf(alpha)
-    # y_lower_cut = mu[:, None] - zcrit * sigma[:, None]
-    # y_upper_cut = mu[:, None] + zcrit * sigma[:, None]
+    y_lower_cut = mu + norm.ppf(alpha) * sigma
+    y_upper_cut = mu + norm.isf(alpha) * sigma
 
     # -----------------------------
     # 7) individual-level failures
@@ -687,7 +469,7 @@ def write_outlier_windows(fail_window_positions, outfix, samples, window=10_000,
         center_label = "median" if use_median else "mean"
 
         ofi.write(
-            f'chrom_position\twindow_start\t\tfrac\tlow_frac\thigh_frac\t'
+            f'chrom_position\twindow_start\tfrac\tlow_frac\thigh_frac\t'
             f'norm_depth_{center_label}\tnorm_depth_lower_cut\tnorm_depth_upper_cut\t'
             f'low_depth_ids\thigh_depth_ids\n'
         )
